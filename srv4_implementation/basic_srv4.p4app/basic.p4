@@ -104,34 +104,42 @@ control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
 control MyIngress(inout headers hdr,
                   inout metadata meta,
                   inout standard_metadata_t standard_metadata) {
+    // Action to drop the packet
     action drop() {
         mark_to_drop(standard_metadata);
     }
+
+    // Action to process the next SRv4 segment ID
     action srv4_next_c_sid() {
         bit<8> subnet_id;
         bit<8> current_sid;
         bit<16> curry;
+        // Extract subnet ID and current SID from the destination address
         subnet_id = hdr.ipv4.dstAddr[31:24];
         current_sid = hdr.ipv4.dstAddr[23:16];
         curry = hdr.ipv4.dstAddr[15:0];
+        // Update the destination address with the next segment ID
         hdr.ipv4.dstAddr[31:24] = subnet_id;
         hdr.ipv4.dstAddr[23:8] = curry;
         hdr.ipv4.dstAddr[7:0] = 0;
     }
+
+    // Table to match on the destination address for SRv4 processing
     table srv4_my_sid {
-      key = {
-          hdr.ipv4.dstAddr: lpm;
-      }
-      actions = {
+        key = {
+            hdr.ipv4.dstAddr: lpm;
+        }
+        actions = {
             srv4_next_c_sid;
             NoAction;
-      }
+        }
     }
+
+    // Action to push a new SRv4 segment ID
     action srv4_push_c_sid(usid_t s1) {
-        // hardcoded asumption that size of each  usid is 8 bits
-        // int<32> i = 0;
+        // Hardcoded assumption that size of each usid is 8 bits
         bit<8> subnet_id = hdr.ipv4.dstAddr[31:24];
-        // hardcoded assumption that size of each subnet is 8 bits
+        // Hardcoded assumption that size of each subnet is 8 bits
         if ((hdr.ipv4.dstAddr & 0x0000FFFF) == 0) {
             bit<8> destination_suffix = hdr.ipv4.dstAddr[23:16];
             hdr.ipv4.dstAddr[15:8] = destination_suffix;
@@ -141,27 +149,31 @@ control MyIngress(inout headers hdr,
             destination_suffix = hdr.ipv4.dstAddr[23:8];
             hdr.ipv4.dstAddr[15:0] = destination_suffix[15:0];
         }
+        // Update the destination address with the new segment ID
         hdr.ipv4.dstAddr[31:24] = subnet_id;
         hdr.ipv4.dstAddr[23:16] = s1;
     }
+
+    // Table to match on the destination address for SRv4 ingress processing
     table srv4_ingress {
         key = {
             hdr.ipv4.dstAddr: lpm;
-          // TODO: what other fields do we want to match?
-      }
-      actions = {
-          srv4_push_c_sid;
-          NoAction;
-      }
-
+        }
+        actions = {
+            srv4_push_c_sid;
+            NoAction;
+        }
     }
+
+    // Action to forward the packet based on the destination MAC address and port
     action ipv4_forward(macAddr_t dstAddr, egressSpec_t port) {
         standard_metadata.egress_spec = port;
         hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
         hdr.ethernet.dstAddr = dstAddr;
         hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
     }
-    
+
+    // Table to match on the destination address for IPv4 forwarding
     table ipv4_lpm {
         key = {
             hdr.ipv4.dstAddr: lpm;
@@ -174,6 +186,8 @@ control MyIngress(inout headers hdr,
         size = 1024;
         default_action = drop();
     }
+
+    // Action to send an ARP reply
     action send_arp_reply(bit<48> target_hw_addr, bit<32> target_proto_addr) {
         hdr.arp.opcode = 2; // ARP reply
         hdr.arp.target_hw_addr = hdr.arp.sender_hw_addr;
@@ -183,28 +197,36 @@ control MyIngress(inout headers hdr,
         hdr.ethernet.dstAddr = hdr.ethernet.srcAddr;
         hdr.ethernet.srcAddr = target_hw_addr;
     }
+
+    // Table to match on ARP requests and send ARP replies
     table arp_table {
-    key = {
-        hdr.arp.opcode: exact;
-        hdr.arp.target_proto_addr: exact;
+        key = {
+            hdr.arp.opcode: exact;
+            hdr.arp.target_proto_addr: exact;
+        }
+        actions = {
+            send_arp_reply;
+            drop;
+        }
+        size = 1024;
+        default_action = drop();
     }
-    actions = {
-        send_arp_reply;
-        drop;
-    }
-    size = 1024;
-    default_action = drop();
-}
+
     apply {
+        // Apply ARP table if ARP header is valid
         if (hdr.arp.isValid()) {
             arp_table.apply();
         }
+        // Apply IPv4 processing if IPv4 header is valid and TTL is greater than 0
         if (hdr.ipv4.isValid() && hdr.ipv4.ttl > 0) {
-            if (srv4_my_sid.apply().hit){
-
+            // Apply SRv4 my SID table
+            if (srv4_my_sid.apply().hit) {
+                // No additional action needed if hit
             } else {
+                // Apply SRv4 ingress table if no hit in my SID table
                 srv4_ingress.apply();
             }
+            // Apply IPv4 LPM table for forwarding
             ipv4_lpm.apply();
         }
     }
